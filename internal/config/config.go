@@ -20,6 +20,10 @@ type Config struct {
 
 // ExecutorConfig holds agentic loop and LLM connection settings.
 type ExecutorConfig struct {
+	// Mode controls which execution strategy is used.
+	// "react" (default): agentic ReAct loop; gpt-oss decides tool use.
+	// "rag":             pre-classify user message → execute tools → synthesize.
+	Mode                     string  `yaml:"mode"`
 	GptOSSURL                string  `yaml:"gpt_oss_url"`
 	GptOSSModel              string  `yaml:"gpt_oss_model"`
 	GptOSSTemperature        float32 `yaml:"gpt_oss_temperature"`
@@ -164,6 +168,9 @@ func applyEnvOverrides(cfg *Config) {
 // applyDefaults sets zero-value fields to their documented defaults.
 func applyDefaults(cfg *Config) {
 	// Executor defaults
+	if cfg.Executor.Mode == "" {
+		cfg.Executor.Mode = "react"
+	}
 	if cfg.Executor.GptOSSModel == "" {
 		cfg.Executor.GptOSSModel = "gpt-oss"
 	}
@@ -235,6 +242,12 @@ func applyDefaults(cfg *Config) {
 // Validate returns an error if required fields are missing or values are out
 // of range.
 func (c *Config) Validate() error {
+	switch c.Executor.Mode {
+	case "react", "rag":
+		// valid
+	default:
+		return fmt.Errorf("executor.mode must be \"react\" or \"rag\", got %q", c.Executor.Mode)
+	}
 	if c.Executor.GptOSSURL == "" {
 		return fmt.Errorf("executor.gpt_oss_url is required")
 	}

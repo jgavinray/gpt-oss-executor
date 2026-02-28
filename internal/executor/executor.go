@@ -142,6 +142,10 @@ func New(cfg *config.Config, logger *slog.Logger, errLogger *logging.ErrorLogger
 // RunTimeoutSeconds as an overall deadline and MaxIterations as a cycle cap.
 // Returns a RunResult on success, or an error when the loop cannot complete.
 func (e *Executor) Run(ctx context.Context, inputMessages []Message) (*RunResult, error) {
+	if strings.EqualFold(e.Config.Executor.Mode, "rag") {
+		return e.RunRAG(ctx, inputMessages)
+	}
+
 	runID := generateRunID()
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(e.Config.Executor.RunTimeoutSeconds)*time.Second)
 	defer cancel()
@@ -607,6 +611,179 @@ func generateRunID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	return fmt.Sprintf("%x", b)
+}
+
+// ---------------------------------------------------------------------------
+// RAG mode
+// ---------------------------------------------------------------------------
+
+// RunRAG implements the pre-classify → execute tools → synthesize execution
+// strategy. Instead of asking gpt-oss to decide when to use tools (which
+// fails because gpt-oss has a hardcoded "You are ChatGPT / cannot browse"
+// system prompt), the executor classifies the user message directly, runs
+// the detected tools, and feeds the results to gpt-oss as retrieved context.
+//
+// Flow:
+//  1. Parse user message with fuzzy intent classifier.
+//  2. Execute each detected tool against the OpenClaw gateway.
+//  3. Build a synthesis prompt: [tool results] + [original question].
+//  4. Call gpt-oss once to synthesise the final answer.
+func (e *Executor) RunRAG(ctx context.Context, inputMessages []Message) (*RunResult, error) {
+	runID := generateRunID()
+	runCtx, cancel := context.WithTimeout(ctx, time.Duration(e.Config.Executor.RunTimeoutSeconds)*time.Second)
+	defer cancel()
+
+	e.Logger.Info("rag run started", slog.String("run_id", runID))
+
+	// Step 1: extract user query and pre-classify tool intents.
+	userQuery := extractUserQuery(inputMessages)
+	if userQuery == "" {
+		return nil, fmt.Errorf("executor: rag: no user message in input")
+	}
+
+	intents := e.Parser.Parse(userQuery)
+	e.Logger.Debug("rag pre-classified intents",
+		slog.String("run_id", runID),
+		slog.Int("intent_count", len(intents)),
+	)
+
+	// Fill any empty arg values (intent-only matches) with the user query.
+	for i, intent := range intents {
+		intents[i] = fillEmptyArgs(intent, userQuery)
+	}
+
+	// Step 2: execute tools and collect results.
+	var contextBlocks strings.Builder
+	for _, intent := range intents {
+		select {
+		case <-runCtx.Done():
+			return nil, execerrors.Wrap(execerrors.ErrRunTimeout, runCtx.Err())
+		default:
+		}
+
+		result, err := e.ToolExecutor.Execute(runCtx, intent)
+		if err != nil {
+			e.Logger.Warn("rag tool execution failed, skipping",
+				slog.String("run_id", runID),
+				slog.String("tool", intent.Name),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+
+		// Pick the most meaningful arg value to label the context block.
+		argLabel := firstArgValue(intent.Args)
+
+		contextBlocks.WriteString(fmt.Sprintf("[%s: %q]\n%s\n\n", intent.Name, argLabel, result))
+
+		e.Logger.Debug("rag tool result collected",
+			slog.String("run_id", runID),
+			slog.String("tool", intent.Name),
+			slog.Int("result_len", len(result)),
+		)
+	}
+
+	// Step 3: build synthesis prompt.
+	synthesisText := buildSynthesisPrompt(userQuery, contextBlocks.String())
+
+	// Step 4: call gpt-oss once for synthesis. Retry up to MaxRetries times
+	// on 0-choice responses (gpt-oss occasionally returns empty on certain
+	// prompt phrasings due to its vLLM tokenizer quirks).
+	synthMessages := []Message{{Role: "user", Content: synthesisText}}
+
+	maxAttempts := e.Config.Executor.MaxRetries
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
+
+	var resp *gptOSSRawResponse
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(500 * time.Millisecond):
+			case <-runCtx.Done():
+				return nil, execerrors.Wrap(execerrors.ErrRunTimeout, runCtx.Err())
+			}
+		}
+		var callErr error
+		resp, callErr = e.callGptOss(runCtx, synthMessages)
+		if callErr != nil {
+			return nil, fmt.Errorf("executor: rag synthesis call: %w", callErr)
+		}
+		if len(resp.Choices) > 0 {
+			break
+		}
+		e.Logger.Warn("rag synthesis returned 0 choices, retrying",
+			slog.String("run_id", runID),
+			slog.Int("attempt", attempt+1),
+		)
+	}
+	if len(resp.Choices) == 0 {
+		return nil, fmt.Errorf("executor: rag synthesis: gpt-oss returned 0 choices after %d attempts", maxAttempts)
+	}
+
+	answer := strings.TrimSpace(resp.Choices[0].Message.Content)
+	if answer == "" {
+		// Content is empty — gpt-oss put everything in reasoning.
+		// Try one follow-up call to extract a clean final answer.
+		reasoning := strings.TrimSpace(resp.Choices[0].Message.ReasoningContent)
+		if reasoning != "" {
+			followUpMessages := append(synthMessages,
+				Message{Role: "assistant", Content: ""},
+				Message{Role: "user", Content: "Based on your analysis, state the final answer concisely:"},
+			)
+			followUp, followErr := e.callGptOss(runCtx, followUpMessages)
+			if followErr == nil && len(followUp.Choices) > 0 {
+				answer = strings.TrimSpace(followUp.Choices[0].Message.Content)
+			}
+			// Last resort: use the reasoning text directly.
+			if answer == "" {
+				answer = reasoning
+			}
+		}
+	}
+
+	e.Logger.Info("rag run complete",
+		slog.String("run_id", runID),
+		slog.Bool("had_tools", contextBlocks.Len() > 0),
+		slog.Int("answer_len", len(answer)),
+	)
+
+	return &RunResult{
+		RunID:      runID,
+		Answer:     answer,
+		Iterations: 1,
+		Messages:   synthMessages,
+	}, nil
+}
+
+// buildSynthesisPrompt constructs the prompt sent to gpt-oss in RAG mode.
+// The query is always wrapped in a structured frame to avoid triggering
+// gpt-oss's vLLM tokenizer quirks that fire on certain raw phrasings.
+// The prompt explicitly instructs gpt-oss to produce a direct final answer
+// in its response content — not to suggest further searches or fetches.
+func buildSynthesisPrompt(userQuery, toolResults string) string {
+	if strings.TrimSpace(toolResults) == "" {
+		return fmt.Sprintf(
+			"Answer the following question. Provide a direct, complete answer in your response.\n\nQuestion: %s\n\nProvide your answer now:",
+			userQuery,
+		)
+	}
+	return fmt.Sprintf(
+		"The following information was retrieved to help answer a question.\n\nRetrieved information:\n%s\nQuestion: %s\n\nUsing the retrieved information above, provide a direct and complete answer. Do not suggest fetching more URLs or performing additional searches — work with the information provided. If it is insufficient, state specifically what was found and what is missing.\n\nAnswer:",
+		toolResults, userQuery,
+	)
+}
+
+// firstArgValue returns the first non-empty value from args, used to label
+// context blocks in RAG mode. Returns "" when args is empty.
+func firstArgValue(args map[string]string) string {
+	for _, v := range args {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // extractUserQuery returns the content of the first user-role message in msgs,

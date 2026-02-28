@@ -108,9 +108,15 @@ var fuzzyArgPatternDefs = map[string][]string{
 // original user message as the query/input.
 var fuzzyIntentPatternDefs = map[string][]string{
 	"web_search": {
+		// Explicit search verbs
 		`(?i)\b(?:search|browse\s+(?:the\s+)?web|look\s+up|google|web\s+search)\b`,
 		`(?i)\buse\s+(?:search|web_search)\b`,
 		`(?i)\b(?:search|browse)\s+(?:the\s+)?(?:web|internet|online)\b`,
+		// Real-time / current-data signals — user is asking for live info
+		`(?i)\b(?:current|today'?s?|latest|live|right\s+now|real[\s-]?time)\b.{0,40}\b(?:price|rate|stock|value|cost|quote|news|score|weather|temperature)\b`,
+		`(?i)\b(?:price|rate|stock|value|cost|quote|news|score|weather|temperature)\b.{0,40}\b(?:current|today|latest|live|now|real[\s-]?time)\b`,
+		// What is X today / right now
+		`(?i)\bwhat\s+is\s+(?:the\s+)?(?:current|today'?s?|latest)\b`,
 	},
 	"web_fetch": {
 		`(?i)\b(?:fetch|retrieve|download)\s+(?:the\s+)?(?:url|page|site)\b`,
