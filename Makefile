@@ -1,4 +1,4 @@
-.PHONY: build run test lint clean tidy
+.PHONY: build run test test-verbose test-integration lint clean tidy
 
 BIN := bin/gpt-oss-executor
 CONFIG := config/executor.yaml
@@ -15,6 +15,11 @@ test:
 
 test-verbose:
 	go test -race -v ./...
+
+# Integration tests require real services. Set env vars before running:
+#   GPTOSS_URL, OPENCLAW_URL, GPTOSS_EXECUTOR_GATEWAY_TOKEN
+test-integration:
+	go test -tags integration -race -v -timeout 120s ./tests/
 
 lint:
 	go vet ./...
