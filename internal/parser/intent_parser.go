@@ -32,8 +32,13 @@ type IntentParser struct {
 	// returns no results. Same valid values as Strategy.
 	FallbackStrategy string
 
-	fuzzyPatterns map[string]*regexp.Regexp
-	toolAliases   map[string]string
+	// fuzzyArgPatterns holds multiple compiled patterns per tool for argument
+	// extraction — first match wins.
+	fuzzyArgPatterns map[string][]*regexp.Regexp
+	// fuzzyIntentPatterns holds broad keyword patterns that detect tool intent
+	// even when a specific argument cannot be extracted from the reasoning text.
+	fuzzyIntentPatterns map[string][]*regexp.Regexp
+	toolAliases         map[string]string
 }
 
 // toolAliases maps every known surface spelling to a canonical tool name that
@@ -68,14 +73,48 @@ var defaultAliases = map[string]string{
 	"browse":  "browser",
 }
 
-// fuzzyPatternDefs holds the raw pattern strings used for Tier 4 matching.
-// Keyed by canonical tool name.
-var fuzzyPatternDefs = map[string]string{
-	"web_search": `(?i)(?:search|look up|query|find)\s+(?:for\s+)?["']?(.+?)["']?(?:\s+(?:on|using|via|with)|[.\n]|$)`,
-	"web_fetch":  `(?i)(?:fetch|retrieve|get|download|open)\s+(?:the\s+)?(?:page|url|site|content)?\s*(?:at|from)?\s*(https?://\S+)`,
-	"read":       "(?i)(?:read|open|view|check|load)\\s+(?:the\\s+)?(?:file|contents?\\s+of\\s+)?\\s*[\"'`]?([/~][\\w.\\-/]+)[\"'`]?",
-	"write":      "(?i)(?:write|save|create|output)\\s+(?:to|as|the file)\\s+[\"'`]?([/~][\\w.\\-/]+)[\"'`]?",
-	"exec":       "(?i)(?:run|execute|exec)\\s+(?:the\\s+)?(?:command|shell|bash)?\\s*[\"'`]([^\"'`\\n]+)[\"'`]",
+// fuzzyArgPatternDefs holds multiple raw pattern strings per tool for Tier 4
+// argument extraction. Patterns are tried in order; the first capture group of
+// the first matching pattern is used as the argument value.
+var fuzzyArgPatternDefs = map[string][]string{
+	"web_search": {
+		// "search for X", "look up X", "find X"
+		`(?i)(?:search|look\s+up|query|find)\s+(?:for\s+)?["']?(.+?)["']?(?:\s+(?:on|using|via|with)|[.\n]|$)`,
+		// "browse the web to get/find X"
+		`(?i)browse\s+(?:the\s+)?web\s+(?:to\s+(?:get|find|look\s+up|retrieve|check)\s+)?["']?(.+?)["']?(?:[.\n]|$)`,
+		// "need/want/going to search/browse/google X"
+		`(?i)(?:need|want|should|going)\s+to\s+(?:search|browse|look\s+up|google|find|check)\s+(?:(?:the\s+)?web\s+)?(?:for\s+|to\s+get\s+|about\s+)?["']?(.+?)["']?(?:[.\n]|$)`,
+		// "to get the current X", "to find the X"
+		`(?i)\bto\s+(?:get|find|retrieve|check|look\s+up)\s+(?:the\s+)?(?:current\s+)?["']?(.+?)["']?(?:[.\n]|$)`,
+	},
+	"web_fetch": {
+		// "fetch/get the page at URL"
+		`(?i)(?:fetch|retrieve|get|download|open)\s+(?:the\s+)?(?:page|url|site|content)?\s*(?:at|from)?\s*(https?://\S+)`,
+	},
+	"read": {
+		"(?i)(?:read|open|view|check|load)\\s+(?:the\\s+)?(?:file|contents?\\s+of\\s+)?\\s*[\"'`]?([/~][\\w.\\-/]+)[\"'`]?",
+	},
+	"write": {
+		"(?i)(?:write|save|create|output)\\s+(?:to|as|the file)\\s+[\"'`]?([/~][\\w.\\-/]+)[\"'`]?",
+	},
+	"exec": {
+		"(?i)(?:run|execute|exec)\\s+(?:the\\s+)?(?:command|shell|bash)?\\s*[\"'`]([^\"'`\\n]+)[\"'`]",
+	},
+}
+
+// fuzzyIntentPatternDefs holds broad keyword patterns that detect tool intent
+// when specific argument extraction fails. If any pattern matches, an intent
+// is returned with an empty argument so the executor can fall back to the
+// original user message as the query/input.
+var fuzzyIntentPatternDefs = map[string][]string{
+	"web_search": {
+		`(?i)\b(?:search|browse\s+(?:the\s+)?web|look\s+up|google|web\s+search)\b`,
+		`(?i)\buse\s+(?:search|web_search)\b`,
+		`(?i)\b(?:search|browse)\s+(?:the\s+)?(?:web|internet|online)\b`,
+	},
+	"web_fetch": {
+		`(?i)\b(?:fetch|retrieve|download)\s+(?:the\s+)?(?:url|page|site)\b`,
+	},
 }
 
 // fuzzyArgKeys maps each canonical tool name to the argument key that the
@@ -97,16 +136,30 @@ func New(strategy, fallback string) *IntentParser {
 		aliases[k] = v
 	}
 
-	patterns := make(map[string]*regexp.Regexp, len(fuzzyPatternDefs))
-	for tool, raw := range fuzzyPatternDefs {
-		patterns[tool] = regexp.MustCompile(raw)
+	argPatterns := make(map[string][]*regexp.Regexp, len(fuzzyArgPatternDefs))
+	for tool, raws := range fuzzyArgPatternDefs {
+		compiled := make([]*regexp.Regexp, 0, len(raws))
+		for _, raw := range raws {
+			compiled = append(compiled, regexp.MustCompile(raw))
+		}
+		argPatterns[tool] = compiled
+	}
+
+	intentPatterns := make(map[string][]*regexp.Regexp, len(fuzzyIntentPatternDefs))
+	for tool, raws := range fuzzyIntentPatternDefs {
+		compiled := make([]*regexp.Regexp, 0, len(raws))
+		for _, raw := range raws {
+			compiled = append(compiled, regexp.MustCompile(raw))
+		}
+		intentPatterns[tool] = compiled
 	}
 
 	return &IntentParser{
-		Strategy:         strategy,
-		FallbackStrategy: fallback,
-		fuzzyPatterns:    patterns,
-		toolAliases:      aliases,
+		Strategy:            strategy,
+		FallbackStrategy:    fallback,
+		fuzzyArgPatterns:    argPatterns,
+		fuzzyIntentPatterns: intentPatterns,
+		toolAliases:         aliases,
 	}
 }
 
@@ -352,7 +405,14 @@ func (p *IntentParser) parseMarkers(text string) []ToolIntent {
 // ---------------------------------------------------------------------------
 
 // parseFuzzy handles Tier 4: heuristic natural-language pattern matching.
-// Confidence is 0.6.
+//
+// For each tool it first tries to extract a specific argument using the
+// multi-pattern list in fuzzyArgPatterns (first match wins). If no argument
+// pattern matches but a broad intent keyword is detected via
+// fuzzyIntentPatterns, an intent is still returned with an empty argument
+// value — the executor is expected to substitute the original user query.
+//
+// Confidence is 0.6 with a specific argument, 0.4 for intent-only matches.
 func (p *IntentParser) parseFuzzy(text string) []ToolIntent {
 	var intents []ToolIntent
 
@@ -360,27 +420,51 @@ func (p *IntentParser) parseFuzzy(text string) []ToolIntent {
 	toolOrder := []string{"web_search", "web_fetch", "read", "write", "exec"}
 
 	for _, tool := range toolOrder {
-		re, ok := p.fuzzyPatterns[tool]
-		if !ok {
-			continue
-		}
-		m := re.FindStringSubmatch(text)
-		if m == nil || len(m) < 2 {
-			continue
-		}
 		if intentExists(intents, tool) {
 			continue
 		}
 
-		val := strings.TrimSpace(m[1])
 		argKey := fuzzyArgKeys[tool]
-		args := map[string]string{argKey: val}
 
-		intents = append(intents, ToolIntent{
-			Name:       tool,
-			Args:       args,
-			Confidence: 0.6,
-		})
+		// Phase 1: try to extract a specific argument value.
+		var matchedVal string
+		for _, re := range p.fuzzyArgPatterns[tool] {
+			m := re.FindStringSubmatch(text)
+			if m != nil && len(m) >= 2 {
+				val := strings.TrimSpace(m[1])
+				if val != "" {
+					matchedVal = val
+					break
+				}
+			}
+		}
+
+		if matchedVal != "" {
+			intents = append(intents, ToolIntent{
+				Name:       tool,
+				Args:       map[string]string{argKey: matchedVal},
+				Confidence: 0.6,
+			})
+			continue
+		}
+
+		// Phase 2: detect broad intent even without an extractable argument.
+		// Return the intent with an empty arg value; the executor will
+		// substitute the original user message as the query/input.
+		intentDetected := false
+		for _, re := range p.fuzzyIntentPatterns[tool] {
+			if re.MatchString(text) {
+				intentDetected = true
+				break
+			}
+		}
+		if intentDetected {
+			intents = append(intents, ToolIntent{
+				Name:       tool,
+				Args:       map[string]string{argKey: ""},
+				Confidence: 0.4,
+			})
+		}
 	}
 
 	return intents

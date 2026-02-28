@@ -153,6 +153,11 @@ func (e *Executor) Run(ctx context.Context, inputMessages []Message) (*RunResult
 
 	messages := e.buildInitialMessages(inputMessages)
 
+	// Extract the original user query for use as a fallback argument when the
+	// fuzzy parser detects tool intent but cannot extract a specific value
+	// (e.g. "Use search." without an explicit query term).
+	originalUserQuery := extractUserQuery(inputMessages)
+
 	var (
 		answer      string
 		lastContent string // tracks last non-empty content from gpt-oss
@@ -294,6 +299,11 @@ func (e *Executor) Run(ctx context.Context, inputMessages []Message) (*RunResult
 				return nil, execerrors.Wrap(execerrors.ErrRunTimeout, runCtx.Err())
 			default:
 			}
+
+			// Fuzzy intent-only matches (confidence 0.4) may have empty arg
+			// values. Substitute the original user query so the tool has
+			// something meaningful to work with.
+			intent = fillEmptyArgs(intent, originalUserQuery)
 
 			toolResult, toolErr := e.ToolExecutor.Execute(runCtx, intent)
 			if toolErr != nil {
@@ -597,4 +607,34 @@ func generateRunID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	return fmt.Sprintf("%x", b)
+}
+
+// extractUserQuery returns the content of the first user-role message in msgs,
+// trimmed of leading/trailing whitespace. Returns "" if no user message exists.
+func extractUserQuery(msgs []Message) string {
+	for _, m := range msgs {
+		if m.Role == "user" {
+			return strings.TrimSpace(m.Content)
+		}
+	}
+	return ""
+}
+
+// fillEmptyArgs returns a copy of intent with any empty argument values
+// replaced by fallback. This handles low-confidence fuzzy intent-only matches
+// where the parser detected tool use but could not extract a specific argument.
+func fillEmptyArgs(intent parser.ToolIntent, fallback string) parser.ToolIntent {
+	if fallback == "" {
+		return intent
+	}
+	filled := make(map[string]string, len(intent.Args))
+	for k, v := range intent.Args {
+		if strings.TrimSpace(v) == "" {
+			filled[k] = fallback
+		} else {
+			filled[k] = v
+		}
+	}
+	intent.Args = filled
+	return intent
 }
