@@ -49,7 +49,7 @@ type gptOSSRawResponse struct {
 		Message struct {
 			Role             string `json:"role"`
 			Content          string `json:"content"`
-			ReasoningContent string `json:"reasoning_content,omitempty"`
+			ReasoningContent string `json:"reasoning,omitempty"` // gpt-oss uses "reasoning" not "reasoning_content"
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -154,8 +154,9 @@ func (e *Executor) Run(ctx context.Context, inputMessages []Message) (*RunResult
 	messages := e.buildInitialMessages(inputMessages)
 
 	var (
-		answer     string
-		iterations int
+		answer      string
+		lastContent string // tracks last non-empty content from gpt-oss
+		iterations  int
 	)
 
 	for iterations = 0; iterations < e.Config.Executor.MaxIterations; iterations++ {
@@ -195,8 +196,20 @@ func (e *Executor) Run(ctx context.Context, inputMessages []Message) (*RunResult
 		}
 
 		if len(resp.Choices) == 0 {
-			return nil, execerrors.Wrap(execerrors.ErrEmptyReasoning,
-				fmt.Errorf("vLLM returned 0 choices at iteration %d", iterations+1))
+			// gpt-oss non-deterministically returns 0 choices on certain prompts.
+			// Treat as a transient error and retry the iteration instead of aborting.
+			e.Logger.Warn("gpt-oss returned 0 choices, retrying iteration",
+				slog.String("run_id", runID),
+				slog.Int("iteration", iterations+1),
+			)
+			// Increment iteration counter will happen at the end of the loop.
+			// Sleep briefly to avoid hammering the endpoint.
+			select {
+			case <-time.After(500 * time.Millisecond):
+			case <-runCtx.Done():
+				return nil, execerrors.Wrap(execerrors.ErrRunTimeout, runCtx.Err())
+			}
+			continue
 		}
 
 		choice := resp.Choices[0]
@@ -211,13 +224,32 @@ func (e *Executor) Run(ctx context.Context, inputMessages []Message) (*RunResult
 			slog.Bool("has_reasoning", reasoningContent != ""),
 		)
 
+		// Track last non-empty content for use as fallback answer.
+		if strings.TrimSpace(content) != "" {
+			lastContent = content
+		}
+
 		// Append assistant message to conversation history.
 		messages = append(messages, Message{Role: "assistant", Content: content})
 
 		// Select which field to parse for tool intents.
 		parseSource := e.selectParseSource(reasoningContent, content)
 		if strings.TrimSpace(parseSource) == "" {
-			// Empty parse source — model produced a final answer with no action.
+			if strings.TrimSpace(content) == "" {
+				// Both reasoning and content are empty — gpt-oss produced nothing.
+				// Retry this iteration (non-deterministic model behavior).
+				e.Logger.Warn("gpt-oss returned empty reasoning and content, retrying",
+					slog.String("run_id", runID),
+					slog.Int("iteration", iterations+1),
+				)
+				select {
+				case <-time.After(500 * time.Millisecond):
+				case <-runCtx.Done():
+					return nil, execerrors.Wrap(execerrors.ErrRunTimeout, runCtx.Err())
+				}
+				continue
+			}
+			// Non-empty content with no tool markers — final answer reached.
 			answer = content
 			e.Logger.Info("empty parse source, treating content as final answer",
 				slog.String("run_id", runID),
@@ -225,6 +257,17 @@ func (e *Executor) Run(ctx context.Context, inputMessages []Message) (*RunResult
 			)
 			break
 		}
+
+		// Temporary debug: log parse source
+		parsePreview := parseSource
+		if len(parsePreview) > 300 {
+			parsePreview = parsePreview[:300]
+		}
+		e.Logger.Debug("parse source",
+			slog.String("run_id", runID),
+			slog.Int("iteration", iterations+1),
+			slog.String("source_preview", parsePreview),
+		)
 
 		intents := e.Parser.Parse(parseSource)
 
@@ -292,8 +335,17 @@ func (e *Executor) Run(ctx context.Context, inputMessages []Message) (*RunResult
 	}
 
 	// Exhausted iteration budget without a clean break.
+	// If gpt-oss produced content along the way, return it as the best answer.
 	if answer == "" {
-		return nil, execerrors.ErrMaxIterations
+		if lastContent != "" {
+			e.Logger.Warn("max iterations reached, returning last content as answer",
+				slog.String("run_id", runID),
+				slog.Int("iterations", iterations),
+			)
+			answer = lastContent
+		} else {
+			return nil, execerrors.ErrMaxIterations
+		}
 	}
 
 	e.Logger.Info("run complete",
@@ -312,13 +364,36 @@ func (e *Executor) Run(ctx context.Context, inputMessages []Message) (*RunResult
 
 // buildInitialMessages prepends the system prompt (if configured) to the
 // caller-supplied messages.
+//
+// NOTE: gpt-oss (vLLM) returns 0 choices when a "system" role message is
+// present — the model has a hardcoded OpenAI system prompt that conflicts.
+// Workaround: inject the system prompt at the top of the first user message
+// instead of using a dedicated system role entry.
 func (e *Executor) buildInitialMessages(input []Message) []Message {
 	if e.SystemPrompt == "" {
 		return input
 	}
-	result := make([]Message, 0, 1+len(input))
-	result = append(result, Message{Role: "system", Content: e.SystemPrompt})
-	result = append(result, input...)
+
+	result := make([]Message, 0, len(input))
+
+	injected := false
+	for _, msg := range input {
+		if !injected && msg.Role == "user" {
+			result = append(result, Message{
+				Role:    "user",
+				Content: e.SystemPrompt + "\n\n" + msg.Content,
+			})
+			injected = true
+		} else {
+			result = append(result, msg)
+		}
+	}
+
+	// No user message found — fall back to prepending a user message.
+	if !injected {
+		result = append([]Message{{Role: "user", Content: e.SystemPrompt}}, result...)
+	}
+
 	return result
 }
 
