@@ -24,6 +24,12 @@ type ExecutorConfig struct {
 	// "react" (default): agentic ReAct loop; gpt-oss decides tool use.
 	// "rag":             pre-classify user message → execute tools → synthesize.
 	Mode                     string  `yaml:"mode"`
+	// RagAutoFetch controls whether RAG mode automatically fetches the top
+	// web_search result URL(s) to supplement snippet-only results.
+	RagAutoFetch             bool    `yaml:"rag_auto_fetch"`
+	// RagFetchTopN is the maximum number of search result URLs to fetch in
+	// RAG mode when RagAutoFetch is true. Default 1.
+	RagFetchTopN             int     `yaml:"rag_fetch_top_n"`
 	GptOSSURL                string  `yaml:"gpt_oss_url"`
 	GptOSSModel              string  `yaml:"gpt_oss_model"`
 	GptOSSTemperature        float32 `yaml:"gpt_oss_temperature"`
@@ -170,6 +176,9 @@ func applyDefaults(cfg *Config) {
 	// Executor defaults
 	if cfg.Executor.Mode == "" {
 		cfg.Executor.Mode = "react"
+	}
+	if cfg.Executor.RagFetchTopN == 0 {
+		cfg.Executor.RagFetchTopN = 1
 	}
 	if cfg.Executor.GptOSSModel == "" {
 		cfg.Executor.GptOSSModel = "gpt-oss"

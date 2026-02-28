@@ -86,6 +86,8 @@ Copy `config/executor.yaml.example` to `config/executor.yaml`. All fields can be
 | Field | Env var override | Default | Description |
 |---|---|---|---|
 | `mode` | — | `react` | Execution strategy: `react` (agentic loop) or `rag` (pre-classify → tools → synthesize) |
+| `rag_auto_fetch` | — | `false` | RAG mode: automatically fetch top search result URL(s) to supplement snippets with full page content |
+| `rag_fetch_top_n` | — | `1` | Maximum number of search result URLs to successfully fetch; tries next candidate if one fails |
 | `gpt_oss_url` | `GPTOSS_EXECUTOR_GPT_OSS_URL` | — | Base URL of the vLLM OpenAI-compatible endpoint |
 | `gpt_oss_model` | — | `gpt-oss` | Model name passed to vLLM in each request |
 | `gpt_oss_temperature` | — | `0.25` | Sampling temperature |

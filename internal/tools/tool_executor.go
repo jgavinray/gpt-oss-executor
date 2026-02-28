@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -268,4 +269,77 @@ func mustParseInt(s string, def int) int {
 		return def
 	}
 	return n
+}
+
+// searchResultOuter is the top-level shape of the web_search tool result.
+type searchResultOuter struct {
+	Content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+	Details struct {
+		Results []struct {
+			URL string `json:"url"`
+		} `json:"results"`
+	} `json:"details"`
+}
+
+// searchResultInner is the shape of the JSON embedded in content[0].text.
+type searchResultInner struct {
+	Results []struct {
+		URL string `json:"url"`
+	} `json:"results"`
+}
+
+// urlRegexp matches both unescaped ("url": "https://...") and escaped
+// (\"url\": \"https://...\") URL patterns for regex fallback on truncated JSON.
+var urlRegexp = regexp.MustCompile(`(?:\\?"url\\?")\s*:\s*(?:\\?")(https?://[^"\\]+)`)
+
+// ExtractSearchURLs parses a web_search tool result string and returns the
+// ordered list of result URLs. It tries three strategies in order:
+//  1. Structured parse of details.results[*].url (present when not truncated).
+//  2. Structured parse of content[0].text as a nested JSON string.
+//  3. Regex scan for URL patterns in the raw bytes (handles truncated JSON).
+func ExtractSearchURLs(result string) []string {
+	// Strategy 1: parse details.results directly.
+	var outer searchResultOuter
+	if err := json.Unmarshal([]byte(result), &outer); err == nil {
+		urls := make([]string, 0, len(outer.Details.Results))
+		for _, r := range outer.Details.Results {
+			if r.URL != "" {
+				urls = append(urls, r.URL)
+			}
+		}
+		if len(urls) > 0 {
+			return urls
+		}
+
+		// Strategy 2: content[0].text is itself a JSON string — parse it.
+		if len(outer.Content) > 0 && outer.Content[0].Text != "" {
+			var inner searchResultInner
+			if err2 := json.Unmarshal([]byte(outer.Content[0].Text), &inner); err2 == nil {
+				urls = make([]string, 0, len(inner.Results))
+				for _, r := range inner.Results {
+					if r.URL != "" {
+						urls = append(urls, r.URL)
+					}
+				}
+				if len(urls) > 0 {
+					return urls
+				}
+			}
+		}
+	}
+
+	// Strategy 3: regex scan — handles truncated JSON from result_limits.
+	matches := urlRegexp.FindAllStringSubmatch(result, -1)
+	urls := make([]string, 0, len(matches))
+	seen := make(map[string]bool)
+	for _, m := range matches {
+		if len(m) >= 2 && !seen[m[1]] {
+			seen[m[1]] = true
+			urls = append(urls, m[1])
+		}
+	}
+	return urls
 }

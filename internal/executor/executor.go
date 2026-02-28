@@ -633,7 +633,11 @@ func (e *Executor) RunRAG(ctx context.Context, inputMessages []Message) (*RunRes
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(e.Config.Executor.RunTimeoutSeconds)*time.Second)
 	defer cancel()
 
-	e.Logger.Info("rag run started", slog.String("run_id", runID))
+	e.Logger.Info("rag run started",
+		slog.String("run_id", runID),
+		slog.Bool("auto_fetch", e.Config.Executor.RagAutoFetch),
+		slog.Int("fetch_top_n", e.Config.Executor.RagFetchTopN),
+	)
 
 	// Step 1: extract user query and pre-classify tool intents.
 	userQuery := extractUserQuery(inputMessages)
@@ -681,6 +685,57 @@ func (e *Executor) RunRAG(ctx context.Context, inputMessages []Message) (*RunRes
 			slog.String("tool", intent.Name),
 			slog.Int("result_len", len(result)),
 		)
+
+		// Auto-fetch: after web_search, fetch the top N result URLs to
+		// supplement snippet-only data with full page content.
+		if intent.Name == "web_search" && e.Config.Executor.RagAutoFetch {
+			urls := tools.ExtractSearchURLs(result)
+			e.Logger.Info("rag auto-fetch url extraction",
+				slog.String("run_id", runID),
+				slog.Int("urls_found", len(urls)),
+				slog.Int("result_len", len(result)),
+			)
+
+			// Attempt to fetch up to RagFetchTopN URLs, continuing to the
+			// next candidate if one fails (e.g. JS-rendered page, 5xx, timeout).
+			// This ensures we don't give up if the top result is blocked.
+			limit := e.Config.Executor.RagFetchTopN
+			if limit <= 0 {
+				limit = 1
+			}
+			fetched := 0
+			for _, u := range urls {
+				if fetched >= limit {
+					break
+				}
+				select {
+				case <-runCtx.Done():
+					return nil, execerrors.Wrap(execerrors.ErrRunTimeout, runCtx.Err())
+				default:
+				}
+				fetchIntent := parser.ToolIntent{
+					Name:       "web_fetch",
+					Args:       map[string]string{"url": u},
+					Confidence: 1.0,
+				}
+				fetchResult, fetchErr := e.ToolExecutor.Execute(runCtx, fetchIntent)
+				if fetchErr != nil {
+					e.Logger.Warn("rag auto-fetch failed, trying next url",
+						slog.String("run_id", runID),
+						slog.String("url", u),
+						slog.String("error", fetchErr.Error()),
+					)
+					continue
+				}
+				contextBlocks.WriteString(fmt.Sprintf("[web_fetch: %q]\n%s\n\n", u, fetchResult))
+				e.Logger.Debug("rag auto-fetch result collected",
+					slog.String("run_id", runID),
+					slog.String("url", u),
+					slog.Int("result_len", len(fetchResult)),
+				)
+				fetched++
+			}
+		}
 	}
 
 	// Step 3: build synthesis prompt.
