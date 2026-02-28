@@ -15,7 +15,10 @@
 12. [Security Considerations](#security-considerations)
 13. [Performance Tuning](#performance-tuning)
 14. [Troubleshooting Guide](#troubleshooting-guide)
-15. [Implementation Roadmap](#implementation-roadmap)
+15. [Key Constraints & Gotchas](#key-constraints--gotchas)
+16. [OpenClaw Gateway API Contract](#openclaw-gateway-api-contract)
+17. [Go Module & Dependencies](#go-module--dependencies)
+18. [Implementation Roadmap](#implementation-roadmap)
 
 ---
 
@@ -413,28 +416,44 @@ import (
 
 // Executor is the main orchestrator
 type Executor struct {
-    // Configuration
+    // gpt-oss connection
     GptOSSURL          string
-    GptOSSModel        string // Usually "gpt-oss"
-    OpenClawGatewayURL string
+    GptOSSModel        string        // Model name sent in API call (default: "gpt-oss")
+    GptOSSTemperature  float32       // Recommended: 0.2-0.3
+    GptOSSMaxTokens    int           // Per-call token limit (default: 1000)
+    GptOSSCallTimeout  time.Duration // Per-call HTTP timeout (default: 60s)
+
+    // OpenClaw gateway connection
+    OpenClawGatewayURL   string
     OpenClawGatewayToken string
-    
+
     // Execution parameters
-    MaxIterations       int
-    RunTimeout          time.Duration
-    GptOSSTemperature   float32
-    GptOSSMaxTokens     int
-    ContextWindowLimit  int
-    ContextBufferTokens int // Usually 2000
-    
+    MaxIterations           int           // Max agentic loop iterations (default: 5)
+    MaxRetries              int           // Max retries for transient errors (default: 3)
+    RunTimeout              time.Duration // Global run timeout (default: 300s)
+    ContextWindowLimit      int           // Model context window size (default: 32768)
+    ContextBufferTokens     int           // Reserved token buffer (default: 2000)
+    ContextCompactThreshold float64       // Trigger compaction at this usage % (default: 0.8)
+    ContextTruncThreshold   float64       // Trigger truncation at this usage % (default: 0.6)
+
+    // Parser configuration
+    ParserStrategy    string           // "guided_json", "react", "markers", "fuzzy"
+    FallbackStrategy  string           // Fallback if primary finds no intents (default: "fuzzy")
+    SourceField       string           // "reasoning" or "content" (default: "reasoning")
+    FallbackField     string           // Fallback field (default: "content")
+    GuidedJSONSchema  map[string]interface{} // Schema for guided_json strategy
+    SystemPromptPath  string           // Path to system prompt file
+
+    // Tool result limits (per-tool max chars before truncation)
+    ToolResultLimits  map[string]int   // e.g., {"web_search": 1000, "web_fetch": 3000}
+
     // Components
-    Logger        *slog.Logger
-    Parser        *parser.IntentParser
-    ToolExecutor  *tools.ToolExecutor
-    ErrorLogger   *logging.ErrorLogger
-    
-    // Metrics (optional)
-    Metrics       *logging.Metrics
+    HTTPClient   *http.Client   // Shared HTTP client with timeouts
+    Logger       *slog.Logger
+    Parser       *parser.IntentParser
+    ToolExecutor *tools.ToolExecutor
+    ErrorLogger  *logging.ErrorLogger
+    Metrics      *logging.Metrics
 }
 
 // RunState tracks the state of a single executor run
@@ -457,13 +476,34 @@ type Message struct {
     Content string `json:"content"`
 }
 
-// GptOSSResponse is the parsed response from gpt-oss API
-type GptOSSResponse struct {
+// GptOSSResponse is the parsed response from gpt-oss API.
+// Note: vLLM returns standard OpenAI format. We unmarshal into the raw
+// structure, then extract fields in callGptOss().
+type GptOSSRawResponse struct {
     ID      string `json:"id"`
-    Content string `json:"choices[0].message.content"`
-    Reasoning string `json:"choices[0].message.reasoning"`
-    Tokens  int    `json:"usage.total_tokens"`
-    FinishReason string `json:"choices[0].finish_reason"`
+    Choices []struct {
+        Index   int `json:"index"`
+        Message struct {
+            Role             string `json:"role"`
+            Content          string `json:"content"`
+            ReasoningContent string `json:"reasoning_content,omitempty"` // vLLM reasoning parser
+        } `json:"message"`
+        FinishReason string `json:"finish_reason"`
+    } `json:"choices"`
+    Usage struct {
+        PromptTokens     int `json:"prompt_tokens"`
+        CompletionTokens int `json:"completion_tokens"`
+        TotalTokens      int `json:"total_tokens"`
+    } `json:"usage"`
+}
+
+// GptOSSResponse is the executor's internal representation after parsing.
+type GptOSSResponse struct {
+    ID           string
+    Content      string
+    Reasoning    string
+    Tokens       int
+    FinishReason string
 }
 
 // ToolIntent is a parsed intent to use a tool
@@ -620,10 +660,25 @@ func (e *Executor) Run(ctx context.Context, userPrompt string) (string, error) {
             "elapsed_ms", time.Since(iterStart).Milliseconds(),
         )
         
-        // 2. Parse tool intents from reasoning
-        intents := e.Parser.Parse(gptResponse.Reasoning)
+        // 2. Parse tool intents — try configured source field, fall back if empty
+        var parseSource string
+        switch e.SourceField {
+        case "reasoning":
+            parseSource = gptResponse.Reasoning
+            if parseSource == "" {
+                parseSource = gptResponse.Content // fallback to content
+                e.Logger.Warn("reasoning_field_empty_using_content",
+                    "run_id", state.RunID,
+                    "iteration", state.Iteration,
+                )
+            }
+        default:
+            parseSource = gptResponse.Content
+        }
+
+        intents := e.Parser.Parse(parseSource)
         state.ToolIntents = intents
-        
+
         if len(intents) == 0 {
             // No tools → assume task complete
             e.Logger.Info("no_tools_requested",
@@ -712,107 +767,315 @@ func (e *Executor) Run(ctx context.Context, userPrompt string) (string, error) {
     return "", fmt.Errorf("max iterations (%d) exceeded", e.MaxIterations)
 }
 
-// callGptOss makes an HTTP request to gpt-oss API
+// callGptOss makes an HTTP request to the gpt-oss vLLM API.
 func (e *Executor) callGptOss(ctx context.Context, messages []Message) (*GptOSSResponse, error) {
-    // Build request
     payload := map[string]interface{}{
         "model":       e.GptOSSModel,
         "messages":    messages,
         "temperature": e.GptOSSTemperature,
         "max_tokens":  e.GptOSSMaxTokens,
     }
-    
-    // Make HTTP call
-    // ... implementation details ...
-    
-    // Parse response
-    var resp GptOSSResponse
-    // ... parsing logic ...
-    
-    return &resp, nil
+
+    // If using guided_json strategy, include the schema
+    if e.ParserStrategy == "guided_json" && e.GuidedJSONSchema != nil {
+        payload["extra_body"] = map[string]interface{}{
+            "guided_json": e.GuidedJSONSchema,
+        }
+    }
+
+    body, err := json.Marshal(payload)
+    if err != nil {
+        return nil, fmt.Errorf("marshaling gpt-oss request: %w", err)
+    }
+
+    req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+        e.GptOSSURL+"/v1/chat/completions", bytes.NewReader(body))
+    if err != nil {
+        return nil, fmt.Errorf("creating gpt-oss request: %w", err)
+    }
+    req.Header.Set("Content-Type", "application/json")
+
+    resp, err := e.HTTPClient.Do(req)
+    if err != nil {
+        return nil, fmt.Errorf("calling gpt-oss: %w", err)
+    }
+    defer resp.Body.Close()
+
+    respBody, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return nil, fmt.Errorf("reading gpt-oss response: %w", err)
+    }
+
+    if resp.StatusCode != http.StatusOK {
+        // Check for context_length_exceeded
+        var apiErr struct {
+            Error struct {
+                Message string `json:"message"`
+                Code    string `json:"code"`
+            } `json:"error"`
+        }
+        if json.Unmarshal(respBody, &apiErr) == nil && apiErr.Error.Code != "" {
+            return nil, &ExecutorError{
+                Code:    apiErr.Error.Code,
+                Message: apiErr.Error.Message,
+            }
+        }
+        return nil, fmt.Errorf("gpt-oss returned HTTP %d: %s", resp.StatusCode, string(respBody))
+    }
+
+    var raw GptOSSRawResponse
+    if err := json.Unmarshal(respBody, &raw); err != nil {
+        return nil, fmt.Errorf("unmarshaling gpt-oss response: %w", err)
+    }
+
+    if len(raw.Choices) == 0 {
+        return nil, fmt.Errorf("gpt-oss returned no choices")
+    }
+
+    return &GptOSSResponse{
+        ID:           raw.ID,
+        Content:      raw.Choices[0].Message.Content,
+        Reasoning:    raw.Choices[0].Message.ReasoningContent,
+        Tokens:       raw.Usage.TotalTokens,
+        FinishReason: raw.Choices[0].FinishReason,
+    }, nil
 }
 
+// isTransientError returns true for errors that are worth retrying.
 func isTransientError(err error) bool {
-    // Check if error is transient (timeout, 5xx)
-    // Return true if should retry
-    return false // Simplified
+    if err == nil {
+        return false
+    }
+    // Context timeout/cancel — don't retry
+    if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+        return false
+    }
+    // Check for our custom error types
+    var execErr *ExecutorError
+    if errors.As(err, &execErr) {
+        switch execErr.Code {
+        case "gpt_oss_unreachable", "tool_execution_failed":
+            return true
+        case "context_window_exceeded", "max_iterations_exceeded":
+            return false
+        }
+    }
+    // Network errors, timeouts, 5xx are transient
+    var netErr net.Error
+    if errors.As(err, &netErr) {
+        return netErr.Timeout() || !netErr.Timeout() // all net errors are transient
+    }
+    // If the error message contains HTTP 5xx indicators
+    errMsg := err.Error()
+    return strings.Contains(errMsg, "HTTP 5") ||
+        strings.Contains(errMsg, "connection refused") ||
+        strings.Contains(errMsg, "connection reset")
 }
 ```
 
-### 4.4 Intent Parser (Fuzzy Matching)
+### 4.4 Intent Parser (Multi-Strategy)
+
+The parser supports multiple strategies configured via `parser.strategy` in the config.
+It also implements a fallback: if the primary strategy finds no intents, the fallback
+strategy is tried. See [prompt-template.md](prompt-template.md) for the corresponding
+system prompts for each strategy.
 
 ```go
 package parser
 
 import (
-    "fmt"
+    "encoding/json"
     "regexp"
     "strings"
 )
 
 type IntentParser struct {
-    patterns map[string]*regexp.Regexp
+    Strategy         string // "guided_json", "react", "markers", "fuzzy"
+    FallbackStrategy string // "fuzzy" (default)
+    fuzzyPatterns    map[string]*regexp.Regexp
+    toolAliases      map[string]string
 }
 
-func NewIntentParser() *IntentParser {
+// Tool name aliases — normalize model variation to canonical names
+var defaultToolAliases = map[string]string{
+    "web_search": "web_search", "websearch": "web_search", "search": "web_search",
+    "web_fetch":  "web_fetch",  "webfetch":  "web_fetch",  "fetch":  "web_fetch",
+    "read_file":  "read",       "readfile":  "read",       "read":   "read", "open": "read",
+    "write_file": "write",      "writefile": "write",      "write":  "write", "save": "write",
+    "execute":    "exec",       "run":       "exec",       "exec":   "exec", "shell": "exec",
+    "browser":    "browser",    "browse":    "browser",
+}
+
+func NewIntentParser(strategy, fallback string) *IntentParser {
     return &IntentParser{
-        patterns: map[string]*regexp.Regexp{
-            "web_search": regexp.MustCompile(`(?i)(search|web_search|query|find).*for\s+["']?([^"'.\n]+)["']?`),
-            "web_fetch":  regexp.MustCompile(`(?i)(fetch|get|retrieve|read|download).*(?:from|the|page|article|url)\s+(?:https?://)?([^\s\n]+)`),
-            "read":       regexp.MustCompile(`(?i)(read|load|open|check)\s+(?:file|document)?\s*(?:named|at|path)?\s+(?:["']?([^\s"'\n]+)["']?)`),
-            "write":      regexp.MustCompile(`(?i)(write|save|store|create).*(?:to|file|named|as)\s+(?:["']?([^\s"'\n]+)["']?)`),
-            "exec":       regexp.MustCompile(`(?i)(execute|run|command|shell).*(?:command:)?\s*["']?([^"'\n]+)["']?`),
+        Strategy:         strategy,
+        FallbackStrategy: fallback,
+        toolAliases:      defaultToolAliases,
+        fuzzyPatterns: map[string]*regexp.Regexp{
+            "web_search": regexp.MustCompile(`(?i)(?:search|look up|query|find)\s+(?:for\s+)?["']?(.+?)["']?(?:\s+(?:on|using|via)|[.\n]|$)`),
+            "web_fetch":  regexp.MustCompile(`(?i)(?:fetch|retrieve|get|download|open)\s+(?:the\s+)?(?:page|url|site|content)?\s*(?:at|from)?\s*(https?://\S+)`),
+            "read":       regexp.MustCompile(`(?i)(?:read|open|view|check)\s+(?:the\s+)?(?:file|contents?\s+of)\s+["'\x60]?([/\w.\-]+)["'\x60]?`),
+            "write":      regexp.MustCompile(`(?i)(?:write|save|create|output)\s+(?:to|as|the file)\s+["'\x60]?([/\w.\-]+)["'\x60]?`),
+            "exec":       regexp.MustCompile(`(?i)(?:run|execute|exec)\s+(?:the\s+)?(?:command|shell|bash)?\s*["'\x60](.+?)["'\x60]`),
         },
     }
 }
 
-func (p *IntentParser) Parse(reasoning string) []ToolIntent {
-    var intents []ToolIntent
-    
-    if reasoning == "" {
-        return intents
+// Parse extracts tool intents from text using the configured strategy.
+// If the primary strategy finds nothing, falls back to the fallback strategy.
+func (p *IntentParser) Parse(text string) []ToolIntent {
+    if text == "" {
+        return nil
     }
-    
-    // Check for each tool pattern
-    for toolName, pattern := range p.patterns {
-        matches := pattern.FindAllStringSubmatch(reasoning, -1)
+
+    intents := p.parseWithStrategy(text, p.Strategy)
+    if len(intents) == 0 && p.FallbackStrategy != "" && p.FallbackStrategy != p.Strategy {
+        intents = p.parseWithStrategy(text, p.FallbackStrategy)
+    }
+    return intents
+}
+
+func (p *IntentParser) parseWithStrategy(text, strategy string) []ToolIntent {
+    switch strategy {
+    case "guided_json":
+        return p.parseGuidedJSON(text)
+    case "react":
+        return p.parseReAct(text)
+    case "markers":
+        return p.parseMarkers(text)
+    case "fuzzy":
+        return p.parseFuzzy(text)
+    default:
+        return p.parseFuzzy(text)
+    }
+}
+
+// parseGuidedJSON — parse structured JSON output from vLLM guided decoding
+func (p *IntentParser) parseGuidedJSON(text string) []ToolIntent {
+    var structured struct {
+        ToolCalls []struct {
+            Name      string            `json:"name"`
+            Arguments map[string]string `json:"arguments"`
+        } `json:"tool_calls"`
+        Done bool `json:"done"`
+    }
+    if err := json.Unmarshal([]byte(text), &structured); err != nil {
+        return nil // Not valid JSON — fall through to fallback
+    }
+    var intents []ToolIntent
+    for _, tc := range structured.ToolCalls {
+        name := p.normalizeTool(tc.Name)
+        if name != "" {
+            intents = append(intents, ToolIntent{Name: name, Args: tc.Arguments, Confidence: 1.0})
+        }
+    }
+    return intents
+}
+
+// parseReAct — parse Thought/Action/Action Input format
+func (p *IntentParser) parseReAct(text string) []ToolIntent {
+    actionRe := regexp.MustCompile(`(?m)^Action:\s*(\w+)\s*$`)
+    inputRe := regexp.MustCompile(`(?m)^Action Input:\s*(.+)$`)
+
+    actions := actionRe.FindAllStringSubmatchIndex(text, -1)
+    var intents []ToolIntent
+
+    for _, actionIdx := range actions {
+        toolName := p.normalizeTool(text[actionIdx[2]:actionIdx[3]])
+        if toolName == "" || toolName == "done" {
+            continue
+        }
+
+        // Find the Action Input line after this Action line
+        remaining := text[actionIdx[1]:]
+        inputMatch := inputRe.FindStringSubmatch(remaining)
+
+        args := make(map[string]string)
+        if len(inputMatch) > 1 {
+            // Try to parse as JSON
+            inputText := strings.TrimSpace(inputMatch[1])
+            if err := json.Unmarshal([]byte(inputText), &args); err != nil {
+                // Not JSON — use as raw value
+                args["input"] = inputText
+            }
+        }
+
+        intents = append(intents, ToolIntent{Name: toolName, Args: args, Confidence: 0.9})
+    }
+    return intents
+}
+
+// parseMarkers — parse [TOOL:name|arg=val] markers
+func (p *IntentParser) parseMarkers(text string) []ToolIntent {
+    toolRegex := regexp.MustCompile(`(?i)\[\s*TOOL\s*:\s*(\w+)\s*\|([^\]]+)\]`)
+    matches := toolRegex.FindAllStringSubmatch(text, -1)
+
+    var intents []ToolIntent
+    for _, m := range matches {
+        toolName := p.normalizeTool(m[1])
+        if toolName == "" {
+            continue
+        }
+        args := make(map[string]string)
+        for _, pair := range strings.Split(m[2], "|") {
+            parts := strings.SplitN(strings.TrimSpace(pair), "=", 2)
+            if len(parts) == 2 {
+                args[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+            }
+        }
+        intents = append(intents, ToolIntent{Name: toolName, Args: args, Confidence: 0.85})
+    }
+    return intents
+}
+
+// parseFuzzy — extract tool intents from natural language using regex patterns
+func (p *IntentParser) parseFuzzy(text string) []ToolIntent {
+    var intents []ToolIntent
+
+    for toolName, pattern := range p.fuzzyPatterns {
+        matches := pattern.FindAllStringSubmatch(text, -1)
         for _, match := range matches {
-            if len(match) > 2 {
-                intent := ToolIntent{
-                    Name: toolName,
-                    Args: make(map[string]string),
-                }
-                
-                // Extract arguments based on tool
+            if len(match) > 1 {
+                args := make(map[string]string)
+                extracted := strings.TrimSpace(match[1])
+
                 switch toolName {
                 case "web_search":
-                    intent.Args["query"] = strings.TrimSpace(match[2])
+                    args["query"] = extracted
                 case "web_fetch":
-                    intent.Args["url"] = normalizeURL(match[2])
+                    args["url"] = normalizeURL(extracted)
                 case "read":
-                    intent.Args["path"] = strings.TrimSpace(match[2])
+                    args["path"] = extracted
                 case "write":
-                    intent.Args["path"] = strings.TrimSpace(match[2])
+                    args["path"] = extracted
                 case "exec":
-                    intent.Args["command"] = strings.TrimSpace(match[2])
+                    args["command"] = extracted
                 }
-                
-                // Avoid duplicates
-                if !intentExists(intents, intent) {
-                    intent.Confidence = 0.85
-                    intents = append(intents, intent)
+
+                if !intentExists(intents, toolName, args) {
+                    intents = append(intents, ToolIntent{
+                        Name: toolName, Args: args, Confidence: 0.6,
+                    })
                 }
             }
         }
     }
-    
     return intents
 }
 
-func intentExists(intents []ToolIntent, target ToolIntent) bool {
+// normalizeTool maps aliases to canonical tool names. Returns "" if unknown.
+func (p *IntentParser) normalizeTool(name string) string {
+    canonical, ok := p.toolAliases[strings.ToLower(strings.TrimSpace(name))]
+    if !ok {
+        return ""
+    }
+    return canonical
+}
+
+func intentExists(intents []ToolIntent, name string, args map[string]string) bool {
     for _, i := range intents {
-        if i.Name == target.Name && i.Args["query"] == target.Args["query"] {
-            return true
+        if i.Name == name {
+            return true // Simple dedup by tool name; could compare args too
         }
     }
     return false
@@ -885,8 +1148,15 @@ func (te *ToolExecutor) executeWithRetry(ctx context.Context, handler ToolHandle
 }
 
 func isRetryableError(err error) bool {
-    // Check if transient (5xx, timeout, etc.)
-    return false // Simplified
+    if err == nil {
+        return false
+    }
+    errMsg := err.Error()
+    // Retry on server errors and network issues
+    return strings.Contains(errMsg, "HTTP 5") ||
+        strings.Contains(errMsg, "connection refused") ||
+        strings.Contains(errMsg, "connection reset") ||
+        strings.Contains(errMsg, "timeout")
 }
 ```
 
@@ -1041,7 +1311,7 @@ func (ta *TokenAccounting) GetUsagePercent() float32 {
 
 ### 7.2 Context Window Budget
 
-For Spark 72B (32K context):
+For gpt-oss 120B (32K context):
 
 ```
 Context Budget Breakdown:
@@ -1115,40 +1385,56 @@ All errors also written to: `logs/YYYY-MM-DD-errors.md`
 ### 9.1 Configuration File (executor.yaml)
 
 ```yaml
-# executor.yaml
+# executor.yaml — All values are overridable via environment variables.
+# Pattern: GPTOSS_EXECUTOR_<SECTION>_<KEY> (e.g., GPTOSS_EXECUTOR_GPT_OSS_URL)
+
 executor:
-  # gpt-oss settings
-  gpt_oss_url: "http://spark:8000"
-  gpt_oss_model: "gpt-oss"
-  gpt_oss_temperature: 0.25
-  gpt_oss_max_tokens: 1000
-  
+  # gpt-oss connection
+  gpt_oss_url: "http://spark:8000"          # env: GPTOSS_EXECUTOR_GPT_OSS_URL
+  gpt_oss_model: "gpt-oss"                  # Model name in API call
+  gpt_oss_temperature: 0.25                 # 0.1-0.3 recommended for tool extraction
+  gpt_oss_max_tokens: 1000                  # Per-call completion token limit
+  gpt_oss_call_timeout_seconds: 60          # Per-call HTTP timeout
+
   # Execution parameters
-  max_iterations: 5
-  run_timeout_seconds: 300
-  context_window_limit: 32768
-  context_buffer_tokens: 2000
-  
+  max_iterations: 5                         # Max agentic loop iterations
+  max_retries: 3                            # Max retries for transient errors
+  run_timeout_seconds: 300                  # Global timeout for entire run
+  context_window_limit: 32768               # Model context window (tokens)
+  context_buffer_tokens: 2000               # Reserved buffer (never use last N tokens)
+  context_compact_threshold: 0.8            # Compact old messages at this % usage
+  context_trunc_threshold: 0.6              # Truncate old results at this % usage
+
   # OpenClaw gateway
-  openclaw_gateway_url: "http://localhost:18789"
-  openclaw_gateway_token: "${OPENCLAW_GATEWAY_TOKEN}"
+  openclaw_gateway_url: "http://localhost:18789"  # env: GPTOSS_EXECUTOR_GATEWAY_URL
+  openclaw_gateway_token: ""                       # env: GPTOSS_EXECUTOR_GATEWAY_TOKEN (required)
+
+# Parser configuration — see docs/prompt-template.md for strategy details
+parser:
+  strategy: "react"                        # "guided_json", "react", "markers", "fuzzy"
+  fallback_strategy: "fuzzy"               # Used when primary finds no intents
+  source_field: "reasoning"                # Parse from this response field first
+  fallback_field: "content"                # Fall back if source_field is empty
+  system_prompt_path: "config/system-prompt.txt"  # Path to system prompt file
+  guided_json_schema_path: ""              # Path to JSON schema (for guided_json strategy)
 
 http_server:
-  port: 8001
+  port: 8001                               # env: GPTOSS_EXECUTOR_PORT
   bind: "127.0.0.1"
   read_timeout_seconds: 30
-  write_timeout_seconds: 30
+  write_timeout_seconds: 600               # Must be >= run_timeout (long-running requests)
+  idle_timeout_seconds: 120
   shutdown_timeout_seconds: 5
 
 logging:
-  level: "info"  # debug, info, warn, error
-  format: "json"
-  output: "stdout"
-  error_log_path: "/Users/jgavinray/Obsidian/personal/zoidberg/logs"
-  error_log_filename: "gpt-oss-executor-errors.md"
+  level: "info"                            # debug, info, warn, error
+  format: "json"                           # json, text
+  output: "stdout"                         # stdout, stderr, or file path
+  error_log_dir: "logs"                    # Directory for error logs
+  error_log_filename: "YYYY-MM-DD-errors.md"  # Filename pattern (YYYY-MM-DD replaced at runtime)
 
 tools:
-  # Which OpenClaw tools are available
+  # Which OpenClaw tools are enabled
   enabled:
     - web_search
     - web_fetch
@@ -1156,7 +1442,19 @@ tools:
     - write
     - exec
     - browser
-  
+
+  # Default timeout for all tools (overridable per-tool below)
+  default_timeout_seconds: 30
+
+  # Per-tool max result size in characters (truncated before injection into context)
+  result_limits:
+    web_search: 1000     # Keep top results with titles + URLs + snippets
+    web_fetch: 3000      # First N chars with truncation marker
+    read: 5000           # Head/tail pattern: first 100 lines + last 20 lines
+    write: 200           # Just confirmation message
+    exec: 2000           # First 1000 + last 500 chars
+    browser: 3000        # Snapshot/screenshot description
+
   # Tool-specific settings
   web_search:
     timeout_seconds: 30
@@ -1164,9 +1462,17 @@ tools:
   web_fetch:
     timeout_seconds: 30
     max_chars: 50000
+    extract_mode: "markdown"
+  read:
+    timeout_seconds: 10
+  write:
+    timeout_seconds: 10
   exec:
     timeout_seconds: 60
-    allow_commands: true
+    allowed_commands: []    # Empty = allow all. Populate to restrict.
+    blocked_commands: ["rm -rf /", "shutdown", "reboot"]
+  browser:
+    timeout_seconds: 30
 ```
 
 ### 9.2 Deployment Steps
@@ -1371,6 +1677,407 @@ Outputs:
 
 ---
 
+## Key Constraints & Gotchas
+
+| Constraint | Why | Mitigation |
+|-----------|-----|-----------|
+| gpt-oss won't produce structured markers | Model training | Use fuzzy NLP-style intent extraction |
+| Reasoning field can be empty/null | Model behavior | Gracefully handle null, don't crash |
+| Token limits (context window) | Spark 32K context | Track tokens, summarize results, abort early if approaching limit |
+| gpt-oss slow (60s+ per call) | Large model on CPU | Implement timeouts, allow retries |
+| Tool execution failures | Network, tool errors | 3-tier recovery (retry → skip → abort) |
+| Runaway loops | Infinite reasoning | Max 5 iterations hard limit |
+| Intent parsing ambiguity | Natural language is ambiguous | Prefer false positives over false negatives; let model correct course |
+
+---
+
+## OpenClaw Gateway API Contract
+
+> **Source:** [docs/openclaw-reference/docs/gateway/tools-invoke-http-api.md](openclaw-reference/docs/gateway/tools-invoke-http-api.md)
+> from OpenClaw v2026.2.19.
+
+### Single Endpoint: POST /tools/invoke
+
+OpenClaw uses a **single unified endpoint** for all tool invocations, not per-tool endpoints.
+
+```
+POST http://<gateway-host>:<port>/tools/invoke
+Authorization: Bearer <token>
+Content-Type: application/json
+```
+
+**Request body:**
+
+```json
+{
+  "tool": "<tool_name>",
+  "action": "<optional_action>",
+  "args": { "<tool-specific args>" },
+  "sessionKey": "main"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `tool` | string | Yes | Tool name: `web_search`, `web_fetch`, `read`, `write`, `exec`, `browser` |
+| `action` | string | No | Mapped into args if tool schema supports `action` |
+| `args` | object | No | Tool-specific arguments (see per-tool examples below) |
+| `sessionKey` | string | No | Target session. Defaults to `"main"` |
+
+**Response:**
+
+```json
+// 200 OK
+{"ok": true, "result": "<tool-specific result>"}
+
+// 400 Bad Request
+{"ok": false, "error": {"type": "...", "message": "..."}}
+
+// 404 Not Found (tool not allowed by policy)
+{"ok": false, "error": {"type": "not_found", "message": "tool not available"}}
+
+// 500 Internal Server Error
+{"ok": false, "error": {"type": "...", "message": "..."}}
+```
+
+### Authentication
+
+- `Authorization: Bearer <token>` header
+- Token is the gateway auth token (`OPENCLAW_GATEWAY_TOKEN` env var)
+- Auth failures return `401`; rate-limited auth returns `429` with `Retry-After`
+
+### Per-Tool Arguments
+
+#### web_search
+```json
+{"tool": "web_search", "args": {"query": "search terms", "count": 10}}
+```
+
+#### web_fetch
+```json
+{"tool": "web_fetch", "args": {"url": "https://example.com", "extractMode": "markdown", "maxChars": 50000}}
+```
+
+#### read
+```json
+{"tool": "read", "args": {"file_path": "/path/to/file", "offset": 0, "limit": 200}}
+```
+
+#### write
+```json
+{"tool": "write", "args": {"file_path": "/path/to/file", "content": "file content"}}
+```
+
+#### exec
+```json
+{"tool": "exec", "args": {"command": "ls -la", "workdir": "/tmp", "timeout": 60}}
+```
+
+#### browser
+```json
+{"tool": "browser", "args": {"action": "navigate", "url": "https://example.com"}}
+{"tool": "browser", "args": {"action": "snapshot"}}
+{"tool": "browser", "args": {"action": "screenshot"}}
+```
+
+### Gateway Tool Policy
+
+Tool availability is filtered by the gateway's policy chain. If a tool is not allowed,
+the endpoint returns 404. The gateway also hard-denies `sessions_spawn`, `sessions_send`,
+`gateway`, and `whatsapp_login` over HTTP by default.
+
+### Tool Handler Implementation (Go)
+
+All tools use the same HTTP call pattern — only the `tool` name and `args` differ:
+
+```go
+// GatewayClient wraps all tool invocations through the unified /tools/invoke endpoint.
+type GatewayClient struct {
+    BaseURL string
+    Token   string
+    Client  *http.Client
+}
+
+type ToolInvokeRequest struct {
+    Tool       string                 `json:"tool"`
+    Action     string                 `json:"action,omitempty"`
+    Args       map[string]interface{} `json:"args,omitempty"`
+    SessionKey string                 `json:"sessionKey,omitempty"`
+}
+
+type ToolInvokeResponse struct {
+    OK     bool            `json:"ok"`
+    Result json.RawMessage `json:"result,omitempty"`
+    Error  *struct {
+        Type    string `json:"type"`
+        Message string `json:"message"`
+    } `json:"error,omitempty"`
+}
+
+// Invoke calls any OpenClaw tool via the gateway.
+func (g *GatewayClient) Invoke(ctx context.Context, toolName string, args map[string]interface{}) (string, error) {
+    payload := ToolInvokeRequest{
+        Tool:       toolName,
+        Args:       args,
+        SessionKey: "main",
+    }
+
+    body, err := json.Marshal(payload)
+    if err != nil {
+        return "", fmt.Errorf("marshaling tool request: %w", err)
+    }
+
+    req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+        g.BaseURL+"/tools/invoke", bytes.NewReader(body))
+    if err != nil {
+        return "", fmt.Errorf("creating tool request: %w", err)
+    }
+    req.Header.Set("Content-Type", "application/json")
+    req.Header.Set("Authorization", "Bearer "+g.Token)
+
+    resp, err := g.Client.Do(req)
+    if err != nil {
+        return "", fmt.Errorf("calling tool %s: %w", toolName, err)
+    }
+    defer resp.Body.Close()
+
+    respBody, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return "", fmt.Errorf("reading tool response: %w", err)
+    }
+
+    var result ToolInvokeResponse
+    if err := json.Unmarshal(respBody, &result); err != nil {
+        return "", fmt.Errorf("decoding tool response: %w", err)
+    }
+
+    if !result.OK {
+        errMsg := "unknown error"
+        if result.Error != nil {
+            errMsg = result.Error.Message
+        }
+        return "", fmt.Errorf("tool %s failed (HTTP %d): %s", toolName, resp.StatusCode, errMsg)
+    }
+
+    // Return the raw result as a string for context injection
+    return string(result.Result), nil
+}
+
+// The ToolExecutor uses GatewayClient for all tools — no per-tool HTTP logic needed.
+func (te *ToolExecutor) Execute(ctx context.Context, intent ToolIntent) (string, error) {
+    // Convert string args to interface{} args
+    args := make(map[string]interface{}, len(intent.Args))
+    for k, v := range intent.Args {
+        args[k] = v
+    }
+    return te.Gateway.Invoke(ctx, intent.Name, args)
+}
+```
+
+---
+
+## Go Module & Dependencies
+
+### go.mod
+
+```
+module github.com/jgavinray/gpt-oss-executor
+
+go 1.22
+
+require (
+    github.com/google/uuid v1.6.0
+    gopkg.in/yaml.v3 v3.0.1
+)
+```
+
+**Dependency rationale:**
+- `github.com/google/uuid` — Generate unique run IDs
+- `gopkg.in/yaml.v3` — Parse `executor.yaml` config file
+- Everything else uses Go stdlib: `net/http`, `log/slog`, `encoding/json`, `regexp`, `context`, `sync`
+
+### Config Loading
+
+```go
+package main
+
+import (
+    "fmt"
+    "os"
+    "gopkg.in/yaml.v3"
+)
+
+type Config struct {
+    Executor struct {
+        GptOSSURL              string  `yaml:"gpt_oss_url"`
+        GptOSSModel            string  `yaml:"gpt_oss_model"`
+        GptOSSTemperature      float32 `yaml:"gpt_oss_temperature"`
+        GptOSSMaxTokens        int     `yaml:"gpt_oss_max_tokens"`
+        GptOSSCallTimeoutSecs  int     `yaml:"gpt_oss_call_timeout_seconds"`
+        MaxIterations          int     `yaml:"max_iterations"`
+        MaxRetries             int     `yaml:"max_retries"`
+        RunTimeoutSecs         int     `yaml:"run_timeout_seconds"`
+        ContextWindowLimit     int     `yaml:"context_window_limit"`
+        ContextBufferTokens    int     `yaml:"context_buffer_tokens"`
+        ContextCompactThreshold float64 `yaml:"context_compact_threshold"`
+        ContextTruncThreshold  float64 `yaml:"context_trunc_threshold"`
+        OpenClawGatewayURL     string  `yaml:"openclaw_gateway_url"`
+        OpenClawGatewayToken   string  `yaml:"openclaw_gateway_token"`
+    } `yaml:"executor"`
+    Parser struct {
+        Strategy             string `yaml:"strategy"`
+        FallbackStrategy     string `yaml:"fallback_strategy"`
+        SourceField          string `yaml:"source_field"`
+        FallbackField        string `yaml:"fallback_field"`
+        SystemPromptPath     string `yaml:"system_prompt_path"`
+        GuidedJSONSchemaPath string `yaml:"guided_json_schema_path"`
+    } `yaml:"parser"`
+    HTTPServer struct {
+        Port                int    `yaml:"port"`
+        Bind                string `yaml:"bind"`
+        ReadTimeoutSecs     int    `yaml:"read_timeout_seconds"`
+        WriteTimeoutSecs    int    `yaml:"write_timeout_seconds"`
+        IdleTimeoutSecs     int    `yaml:"idle_timeout_seconds"`
+        ShutdownTimeoutSecs int    `yaml:"shutdown_timeout_seconds"`
+    } `yaml:"http_server"`
+    Logging struct {
+        Level            string `yaml:"level"`
+        Format           string `yaml:"format"`
+        Output           string `yaml:"output"`
+        ErrorLogDir      string `yaml:"error_log_dir"`
+        ErrorLogFilename string `yaml:"error_log_filename"`
+    } `yaml:"logging"`
+    Tools struct {
+        Enabled              []string       `yaml:"enabled"`
+        DefaultTimeoutSecs   int            `yaml:"default_timeout_seconds"`
+        ResultLimits         map[string]int `yaml:"result_limits"`
+        WebSearch            ToolConfig     `yaml:"web_search"`
+        WebFetch             ToolConfig     `yaml:"web_fetch"`
+        Read                 ToolConfig     `yaml:"read"`
+        Write                ToolConfig     `yaml:"write"`
+        Exec                 ExecToolConfig `yaml:"exec"`
+        Browser              ToolConfig     `yaml:"browser"`
+    } `yaml:"tools"`
+}
+
+type ToolConfig struct {
+    TimeoutSecs int `yaml:"timeout_seconds"`
+}
+
+type ExecToolConfig struct {
+    TimeoutSecs     int      `yaml:"timeout_seconds"`
+    AllowedCommands []string `yaml:"allowed_commands"`
+    BlockedCommands []string `yaml:"blocked_commands"`
+}
+
+func LoadConfig(path string) (*Config, error) {
+    data, err := os.ReadFile(path)
+    if err != nil {
+        return nil, fmt.Errorf("reading config file: %w", err)
+    }
+
+    // Expand environment variables in the YAML (e.g., ${GPTOSS_EXECUTOR_GATEWAY_TOKEN})
+    expanded := os.ExpandEnv(string(data))
+
+    var cfg Config
+    if err := yaml.Unmarshal([]byte(expanded), &cfg); err != nil {
+        return nil, fmt.Errorf("parsing config file: %w", err)
+    }
+
+    // Apply env var overrides (higher priority than file)
+    if v := os.Getenv("GPTOSS_EXECUTOR_GPT_OSS_URL"); v != "" {
+        cfg.Executor.GptOSSURL = v
+    }
+    if v := os.Getenv("GPTOSS_EXECUTOR_GATEWAY_URL"); v != "" {
+        cfg.Executor.OpenClawGatewayURL = v
+    }
+    if v := os.Getenv("GPTOSS_EXECUTOR_GATEWAY_TOKEN"); v != "" {
+        cfg.Executor.OpenClawGatewayToken = v
+    }
+    if v := os.Getenv("GPTOSS_EXECUTOR_PORT"); v != "" {
+        // parse int...
+    }
+    if v := os.Getenv("GPTOSS_EXECUTOR_LOG_LEVEL"); v != "" {
+        cfg.Logging.Level = v
+    }
+
+    return &cfg, nil
+}
+```
+
+### Health Check Endpoint
+
+```go
+// GET /health — returns 200 if the executor is running and can reach gpt-oss
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+    ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+    defer cancel()
+
+    // Check gpt-oss connectivity
+    req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+        s.executor.GptOSSURL+"/v1/models", nil)
+    resp, err := s.executor.HTTPClient.Do(req)
+
+    status := map[string]interface{}{
+        "status":    "ok",
+        "gpt_oss":   "connected",
+        "gateway":   "configured",
+        "timestamp": time.Now().UTC(),
+    }
+
+    if err != nil || resp.StatusCode != http.StatusOK {
+        status["status"] = "degraded"
+        status["gpt_oss"] = "unreachable"
+        w.WriteHeader(http.StatusServiceUnavailable)
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(status)
+}
+```
+
+### Graceful Shutdown
+
+```go
+func main() {
+    // ... setup ...
+
+    srv := &http.Server{
+        Addr:         fmt.Sprintf("%s:%d", cfg.HTTPServer.Bind, cfg.HTTPServer.Port),
+        Handler:      mux,
+        ReadTimeout:  time.Duration(cfg.HTTPServer.ReadTimeoutSecs) * time.Second,
+        WriteTimeout: time.Duration(cfg.HTTPServer.WriteTimeoutSecs) * time.Second,
+        IdleTimeout:  time.Duration(cfg.HTTPServer.IdleTimeoutSecs) * time.Second,
+    }
+
+    // Start server in goroutine
+    go func() {
+        logger.Info("http_server_start", "addr", srv.Addr)
+        if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            logger.Error("http_server_error", "error", err)
+            os.Exit(1)
+        }
+    }()
+
+    // Wait for interrupt signal
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+    <-quit
+
+    logger.Info("http_server_shutting_down")
+    ctx, cancel := context.WithTimeout(context.Background(),
+        time.Duration(cfg.HTTPServer.ShutdownTimeoutSecs)*time.Second)
+    defer cancel()
+
+    if err := srv.Shutdown(ctx); err != nil {
+        logger.Error("http_server_shutdown_error", "error", err)
+    }
+    logger.Info("http_server_stopped")
+}
+```
+
+---
+
 ## Implementation Roadmap
 
 ### Phase 1: Core PoC (1-2 days)
@@ -1478,9 +2185,11 @@ Outputs:
 - **gpt-oss Model:** Local 120B reasoning model via vLLM
 - **OpenClaw Tools:** Full list at `https://docs.openclaw.ai/tools`
 - **OpenAI API:** Chat completions spec at `https://platform.openai.com/docs/api-reference/chat/create`
-- **Go Stdlib:** `net/http`, `log/slog` (Go 1.21+), `context`, `sync`
-- **Project Codebase:** `gpt-oss-executor/` repository
-- **Architecture Review:** `/Users/jgavinray/Obsidian/personal/zoidberg/gpt-oss-poc/opus-architecture-review.md`
+- **Go Stdlib:** `net/http`, `log/slog` (Go 1.22+), `context`, `encoding/json`, `regexp`
+- **Architecture Review:** [docs/architecture-review.md](architecture-review.md)
+- **Risk Remediation:** [docs/risk-remediation.md](risk-remediation.md)
+- **Prompt Templates:** [docs/prompt-template.md](prompt-template.md)
+- **vLLM Docs:** `https://docs.vllm.ai/en/latest/` (guided decoding, tool calling, reasoning)
 
 ---
 

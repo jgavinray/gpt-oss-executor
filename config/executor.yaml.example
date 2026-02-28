@@ -1,0 +1,89 @@
+# executor.yaml.example — copy to executor.yaml and fill in values
+# All values can be overridden via environment variables.
+# Pattern: GPTOSS_EXECUTOR_<UPPER_KEY> (e.g., GPTOSS_EXECUTOR_GATEWAY_TOKEN)
+
+executor:
+  # gpt-oss vLLM connection
+  gpt_oss_url: "http://spark:8000"
+  gpt_oss_model: "gpt-oss"
+  gpt_oss_temperature: 0.25
+  gpt_oss_max_tokens: 1000
+  gpt_oss_call_timeout_seconds: 60
+
+  # Agentic loop control
+  max_iterations: 5
+  max_retries: 3
+  run_timeout_seconds: 300
+
+  # Context window management
+  context_window_limit: 32768
+  context_buffer_tokens: 2000
+  context_compact_threshold: 0.8   # compact messages above this usage %
+  context_trunc_threshold: 0.6     # truncate old results above this usage %
+
+  # OpenClaw gateway — POST /tools/invoke
+  openclaw_gateway_url: "http://localhost:18789"
+  openclaw_gateway_token: ""       # env: GPTOSS_EXECUTOR_GATEWAY_TOKEN (required)
+  openclaw_session_key: "main"     # Gateway session key for tool invocations
+
+parser:
+  strategy: "react"                # guided_json | react | markers | fuzzy
+  fallback_strategy: "fuzzy"
+  source_field: "reasoning"        # reasoning | content
+  fallback_field: "content"
+  system_prompt_path: "config/system-prompt-react.txt"
+  guided_json_schema_path: ""      # Only needed for strategy: guided_json
+
+http_server:
+  port: 8001
+  bind: "127.0.0.1"
+  read_timeout_seconds: 30
+  write_timeout_seconds: 600       # Must be > run_timeout to allow long runs
+  idle_timeout_seconds: 120
+  shutdown_timeout_seconds: 5
+
+logging:
+  level: "info"                    # debug | info | warn | error
+  format: "json"                   # json | text
+  output: "stdout"
+  error_log_dir: "logs"
+  error_log_filename: "errors.md"  # YYYY-MM-DD prepended at runtime
+
+tools:
+  enabled:
+    - web_search
+    - web_fetch
+    - read
+    - write
+    - exec
+    - browser
+  default_timeout_seconds: 30
+
+  # Max result size (chars) per tool before truncation — from openclaw-reference source
+  result_limits:
+    web_search: 1000
+    web_fetch: 3000
+    read: 5000
+    write: 200
+    exec: 2000
+    browser: 3000
+
+  web_search:
+    timeout_seconds: 30
+    max_results: 10
+  web_fetch:
+    timeout_seconds: 30
+    max_chars: 50000
+    extract_mode: "markdown"        # markdown | text (openclaw web_fetch extractMode)
+  read:
+    timeout_seconds: 10
+  write:
+    timeout_seconds: 10
+  exec:
+    timeout_seconds: 60
+    blocked_commands:
+      - "rm -rf /"
+      - "shutdown"
+      - "reboot"
+  browser:
+    timeout_seconds: 30
