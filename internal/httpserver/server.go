@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jgavinray/gpt-oss-executor/internal/config"
@@ -108,6 +109,53 @@ type chatRequest struct {
 type chatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+}
+
+// UnmarshalJSON handles both the simple string format and the OpenAI content-
+// parts array format (e.g. [{"type":"text","text":"..."}]) that the OpenClaw
+// gateway emits when proxying requests to downstream model providers.
+func (m *chatMessage) UnmarshalJSON(data []byte) error {
+	// Use an alias to avoid infinite recursion.
+	type alias struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	m.Role = a.Role
+
+	if len(a.Content) == 0 {
+		return nil
+	}
+
+	// Try plain string first.
+	var s string
+	if err := json.Unmarshal(a.Content, &s); err == nil {
+		m.Content = s
+		return nil
+	}
+
+	// Try content-parts array: [{"type":"text","text":"..."}]
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(a.Content, &parts); err == nil {
+		var sb strings.Builder
+		for _, p := range parts {
+			if p.Type == "text" {
+				sb.WriteString(p.Text)
+			}
+		}
+		m.Content = sb.String()
+		return nil
+	}
+
+	// Fallback: use raw JSON as string.
+	m.Content = string(a.Content)
+	return nil
 }
 
 // chatResponse is the OpenAI-compatible response returned by
