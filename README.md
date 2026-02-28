@@ -13,16 +13,36 @@ gpt-oss-executor bridges this gap. It sits between callers and the model, parsin
 
 ## Architecture
 
-Incoming `POST /v1/chat/completions` requests are received by the executor, which forwards the conversation to a vLLM-served gpt-oss instance. The response is parsed for tool call intents using one of four configurable strategies; matched intents are dispatched to the OpenClaw gateway at `POST /tools/invoke`. Results are injected back into the conversation as `tool` role messages and the loop repeats until the model produces a final answer, the iteration limit is hit, or the run timeout elapses.
+The executor supports two execution modes, selected by `executor.mode` in the config.
+
+### ReAct mode (default)
+
+Incoming `POST /v1/chat/completions` requests are forwarded to gpt-oss. The model's response is parsed for tool call intents using one of four configurable strategies; matched intents are dispatched to the OpenClaw gateway at `POST /tools/invoke`. Results are injected back into the conversation as `tool` role messages and the loop repeats until the model produces a final answer, the iteration limit is hit, or the run timeout elapses.
 
 ```
 client
   └─► POST /v1/chat/completions (port 8001)
-        └─► gpt-oss vLLM (port 8000)
+        └─► gpt-oss vLLM (port 8000)   ← model decides what tools to call
               └─► intent parser
                     └─► OpenClaw gateway POST /tools/invoke (port 18789)
                           └─► tool result injected → repeat
 ```
+
+### RAG mode
+
+The executor classifies the user's message directly — without asking gpt-oss — executes the relevant tools, then calls gpt-oss once with the retrieved context to synthesise a final answer. gpt-oss never needs to emit tool intent; it acts purely as a synthesis engine.
+
+```
+client
+  └─► POST /v1/chat/completions (port 8001)
+        └─► fuzzy intent classifier (user message)
+              └─► OpenClaw gateway POST /tools/invoke (port 18789)
+                    └─► synthesis prompt (question + tool results)
+                          └─► gpt-oss vLLM (port 8000)   ← one synthesis call
+                                └─► answer returned
+```
+
+RAG mode is more predictable than ReAct because it does not rely on the model deciding when and how to call tools. It is the recommended mode when the model has a hardcoded system prompt (e.g. gpt-oss ships with a "You are ChatGPT / cannot browse" prompt baked into its vLLM serving config) that conflicts with tool-calling instructions.
 
 ## Prerequisites
 
@@ -65,6 +85,7 @@ Copy `config/executor.yaml.example` to `config/executor.yaml`. All fields can be
 
 | Field | Env var override | Default | Description |
 |---|---|---|---|
+| `mode` | — | `react` | Execution strategy: `react` (agentic loop) or `rag` (pre-classify → tools → synthesize) |
 | `gpt_oss_url` | `GPTOSS_EXECUTOR_GPT_OSS_URL` | — | Base URL of the vLLM OpenAI-compatible endpoint |
 | `gpt_oss_model` | — | `gpt-oss` | Model name passed to vLLM in each request |
 | `gpt_oss_temperature` | — | `0.25` | Sampling temperature |
@@ -133,6 +154,26 @@ Per-tool sub-sections (`web_search`, `web_fetch`, `read`, `write`, `exec`, `brow
 | `fuzzy` | 0.6 | Last-resort natural language pattern matching. Catches plain-English requests such as "search for X" or "fetch https://...". Always safe as a fallback. |
 
 The `fallback_strategy` field names the strategy tried when the primary returns no intents. The default pair (`react` + `fuzzy`) covers the widest range of model outputs without schema constraints.
+
+## vLLM / gpt-oss quirks
+
+These are observed behaviours of the gpt-oss model served via vLLM that affect executor configuration.
+
+### `max_tokens` safe range
+
+vLLM returns an `Unexpected token NNNNN` special-token parse error when `max_tokens` is set outside the range **300–750**. Values below 300 or at 1000+ reliably trigger this error. Set `gpt_oss_max_tokens` to a value in the 350–700 range.
+
+### System role messages return 0 choices
+
+Sending a `{"role": "system", ...}` message causes vLLM to return `choices: []` with no error. The executor works around this by injecting any system prompt into the first user message instead. If you supply a `system_prompt_path`, it is prepended to the user message content, not sent as a separate system turn.
+
+### Hardcoded "You are ChatGPT" system prompt
+
+gpt-oss ships with a hardcoded OpenAI system prompt baked into its vLLM serving configuration. This prompt instructs the model that it is ChatGPT and cannot browse the internet. User-supplied system prompts are overridden by this baked-in prompt, which means the model will not spontaneously emit tool call intent in ReAct mode. **RAG mode is not affected** because it classifies the user's message directly and does not rely on the model deciding to use tools.
+
+### Certain phrase patterns trigger tokenizer errors
+
+Specific input phrasings — notably "Search the web for..." — trigger a `BadRequestError` (HTTP 400) from vLLM due to special-token conflicts in the chat template. If you observe 0-choice responses or 400 errors for prompts that work in other phrasings, the input may be hitting one of these patterns. In RAG mode the synthesis prompt is always wrapped in a neutral task frame ("Task: answer the following question...") which avoids the known bad patterns.
 
 ## Development
 
