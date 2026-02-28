@@ -3,11 +3,22 @@
 # Pattern: GPTOSS_EXECUTOR_<UPPER_KEY> (e.g., GPTOSS_EXECUTOR_GATEWAY_TOKEN)
 
 executor:
+  # Execution strategy: "react" (agentic loop) | "rag" (pre-classify → tools → synthesize)
+  # Use "rag" when the model has a hardcoded system prompt that conflicts with tool-calling
+  # (e.g. gpt-oss ships with "You are ChatGPT / cannot browse" baked in via vLLM config).
+  mode: "react"
+
+  # RAG mode options (only used when mode: "rag")
+  rag_auto_fetch: true             # fetch top search result URL(s) to supplement snippets
+  rag_fetch_top_n: 3               # max successful fetches per search (tries next on failure)
+
   # gpt-oss vLLM connection
   gpt_oss_url: "http://spark:8000"
   gpt_oss_model: "gpt-oss"
   gpt_oss_temperature: 0.25
-  gpt_oss_max_tokens: 1000
+  # IMPORTANT: keep max_tokens in range 300-750. Values outside this range trigger
+  # vLLM special-token parse errors ("Unexpected token NNNNN").
+  gpt_oss_max_tokens: 700
   gpt_oss_call_timeout_seconds: 60
 
   # Agentic loop control
@@ -61,7 +72,7 @@ tools:
 
   # Max result size (chars) per tool before truncation — from openclaw-reference source
   result_limits:
-    web_search: 1000
+    web_search: 6000              # 6000+ needed for URL extraction in RAG auto-fetch
     web_fetch: 3000
     read: 5000
     write: 200
