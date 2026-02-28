@@ -2,6 +2,15 @@
 
 An OpenAI-compatible HTTP gateway that wraps a local 120B reasoning model (gpt-oss) with an agentic loop, routing tool calls through the OpenClaw gateway.
 
+## Problem
+
+OpenClaw provides a rich set of tools (web search, file read/write, shell exec, browser control) accessible through a gateway API, but the built-in model driving those tools has limited reasoning depth. A locally-hosted 120B reasoning model (gpt-oss, served via vLLM) has substantially better planning and multi-step reasoning capabilities — but it has two problems:
+
+1. **It speaks text, not tool calls.** vLLM serves gpt-oss as a raw completion endpoint. The model produces reasoning output in natural language or structured text formats, not OpenClaw's native tool protocol.
+2. **It has no execution environment.** Even when the model correctly identifies what tools to call, it has no mechanism to actually invoke them, receive results, and continue reasoning.
+
+gpt-oss-executor bridges this gap. It sits between callers and the model, parsing the model's output for tool intents, executing those tools through OpenClaw's existing gateway, and feeding results back so the model can reason further. The result is a locally-hosted reasoning agent that can use all of OpenClaw's tooling without modifications to either gpt-oss or the OpenClaw gateway.
+
 ## Architecture
 
 Incoming `POST /v1/chat/completions` requests are received by the executor, which forwards the conversation to a vLLM-served gpt-oss instance. The response is parsed for tool call intents using one of four configurable strategies; matched intents are dispatched to the OpenClaw gateway at `POST /tools/invoke`. Results are injected back into the conversation as `tool` role messages and the loop repeats until the model produces a final answer, the iteration limit is hit, or the run timeout elapses.
