@@ -44,6 +44,7 @@ func New(cfg *config.Config, exec Runner, logger *slog.Logger) *Server {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
+	mux.HandleFunc("GET /v1/models", s.handleModels)
 	mux.HandleFunc("GET /health", s.handleHealth)
 
 	addr := fmt.Sprintf("%s:%d", cfg.HTTPServer.Bind, cfg.HTTPServer.Port)
@@ -251,6 +252,23 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status": "ok",
 		"model":  s.cfg.Executor.GptOSSModel,
+	})
+}
+
+// handleModels implements GET /v1/models — returns an OpenAI-compatible model
+// list so that OpenClaw's /models command can discover this executor as an
+// available model provider.
+func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"object": "list",
+		"data": []map[string]any{
+			{
+				"id":       "executor",
+				"object":   "model",
+				"created":  1700000000,
+				"owned_by": "gpt-oss-executor",
+			},
+		},
 	})
 }
 
