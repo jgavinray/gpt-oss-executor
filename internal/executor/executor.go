@@ -473,7 +473,7 @@ func (e *Executor) callGptOss(ctx context.Context, messages []Message) (*gptOSSR
 		return nil, fmt.Errorf("executor: reading gpt-oss response body: %w", err)
 	}
 
-	// vLLM returns HTTP 400 for context_length_exceeded — surface it distinctly.
+	// vLLM returns HTTP 400 for context_length_exceeded or garbled reasoning.
 	if resp.StatusCode == http.StatusBadRequest {
 		bodyStr := string(body)
 		if strings.Contains(bodyStr, "context_length_exceeded") ||
@@ -481,6 +481,8 @@ func (e *Executor) callGptOss(ctx context.Context, messages []Message) (*gptOSSR
 			return nil, execerrors.Wrap(execerrors.ErrContextWindow,
 				fmt.Errorf("vLLM HTTP 400: %s", strings.TrimSpace(bodyStr)))
 		}
+		// Garbled reasoning output from vLLM — treat as transient so callers
+		// can retry instead of aborting the entire run.
 		return nil, fmt.Errorf("executor: gpt-oss returned HTTP 400: %s", strings.TrimSpace(bodyStr))
 	}
 
@@ -602,6 +604,17 @@ func isContextWindowExceeded(err error) bool {
 	s := err.Error()
 	return strings.Contains(s, "context_length_exceeded") ||
 		strings.Contains(s, "maximum context length")
+}
+
+// isVLLMBadRequest reports whether err represents a vLLM HTTP 400 error caused
+// by garbled reasoning output (e.g. "unexpected tokens remaining in message
+// header"). These are transient and should be retried.
+func isVLLMBadRequest(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "HTTP 400") || strings.Contains(s, "BadRequestError")
 }
 
 // generateRunID returns a 16-character lowercase hex string derived from 8
@@ -752,6 +765,7 @@ func (e *Executor) RunRAG(ctx context.Context, inputMessages []Message) (*RunRes
 	}
 
 	var resp *gptOSSRawResponse
+	var answer string
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
 			select {
@@ -763,24 +777,33 @@ func (e *Executor) RunRAG(ctx context.Context, inputMessages []Message) (*RunRes
 		var callErr error
 		resp, callErr = e.callGptOss(runCtx, synthMessages)
 		if callErr != nil {
+			// Treat transient errors (including vLLM 400s from garbled
+			// reasoning output) as retryable instead of fatal.
+			if execerrors.IsTransientError(callErr) || isVLLMBadRequest(callErr) {
+				e.Logger.Warn("rag synthesis transient error, retrying",
+					slog.String("run_id", runID),
+					slog.Int("attempt", attempt+1),
+					slog.String("error", callErr.Error()),
+				)
+				continue
+			}
 			return nil, fmt.Errorf("executor: rag synthesis call: %w", callErr)
 		}
-		if len(resp.Choices) > 0 {
+		if len(resp.Choices) == 0 {
+			e.Logger.Warn("rag synthesis returned 0 choices, retrying",
+				slog.String("run_id", runID),
+				slog.Int("attempt", attempt+1),
+			)
+			continue
+		}
+
+		// Check for non-empty content.
+		answer = strings.TrimSpace(resp.Choices[0].Message.Content)
+		if answer != "" {
 			break
 		}
-		e.Logger.Warn("rag synthesis returned 0 choices, retrying",
-			slog.String("run_id", runID),
-			slog.Int("attempt", attempt+1),
-		)
-	}
-	if len(resp.Choices) == 0 {
-		return nil, fmt.Errorf("executor: rag synthesis: gpt-oss returned 0 choices after %d attempts", maxAttempts)
-	}
 
-	answer := strings.TrimSpace(resp.Choices[0].Message.Content)
-	if answer == "" {
-		// Content is empty — gpt-oss put everything in reasoning.
-		// Try one follow-up call to extract a clean final answer.
+		// Content is empty — try to salvage from reasoning field.
 		reasoning := strings.TrimSpace(resp.Choices[0].Message.ReasoningContent)
 		if reasoning != "" {
 			followUpMessages := append(synthMessages,
@@ -791,11 +814,22 @@ func (e *Executor) RunRAG(ctx context.Context, inputMessages []Message) (*RunRes
 			if followErr == nil && len(followUp.Choices) > 0 {
 				answer = strings.TrimSpace(followUp.Choices[0].Message.Content)
 			}
-			// Last resort: use the reasoning text directly.
 			if answer == "" {
 				answer = reasoning
 			}
+			if answer != "" {
+				break
+			}
 		}
+
+		e.Logger.Warn("rag synthesis returned empty content, retrying",
+			slog.String("run_id", runID),
+			slog.Int("attempt", attempt+1),
+		)
+	}
+
+	if answer == "" {
+		return nil, fmt.Errorf("executor: rag synthesis: gpt-oss returned empty answer after %d attempts", maxAttempts)
 	}
 
 	e.Logger.Info("rag run complete",

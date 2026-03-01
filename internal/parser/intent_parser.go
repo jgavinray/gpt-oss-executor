@@ -117,6 +117,10 @@ var fuzzyIntentPatternDefs = map[string][]string{
 		`(?i)\b(?:price|rate|stock|value|cost|quote|news|score|weather|temperature)\b.{0,40}\b(?:current|today|latest|live|now|real[\s-]?time)\b`,
 		// What is X today / right now
 		`(?i)\bwhat\s+is\s+(?:the\s+)?(?:current|today'?s?|latest)\b`,
+		// Direct weather/temperature/knowledge questions
+		`(?i)\b(?:temperature|weather|forecast)\s+(?:in|at|for)\s+\S`,
+		`(?i)\bhow\s+(?:hot|cold|warm)\s+is\s+it\b`,
+		`(?i)\b(?:who|what|when|where|why|how)\s+(?:is|are|was|were|did|does|do|has|have|had)\b`,
 	},
 	"web_fetch": {
 		`(?i)\b(?:fetch|retrieve|download)\s+(?:the\s+)?(?:url|page|site)\b`,

@@ -133,21 +133,24 @@ func IsContextWindowError(err error) bool {
 // timeout_exceeded, and the standard library context errors
 // (context.Canceled, context.DeadlineExceeded).
 func IsTransientError(err error) bool {
-	// Standard library context errors are terminal for the current run.
+	// Check for ExecutorError FIRST. An ErrGptOssUnreachable that wraps a
+	// context.DeadlineExceeded (HTTP client timeout) is still transient —
+	// the upstream was slow, not the run itself being cancelled.
+	var execErr *ExecutorError
+	if errors.As(err, &execErr) {
+		switch execErr.Code {
+		case ErrGptOssUnreachable.Code, ErrToolExecution.Code:
+			return true
+		}
+		// ExecutorError with a non-transient code — not retryable.
+		return false
+	}
+
+	// No ExecutorError in chain. Standard context errors are terminal.
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 
-	var execErr *ExecutorError
-	if !errors.As(err, &execErr) {
-		// Unknown error type — treat as non-transient to avoid blind retries.
-		return false
-	}
-
-	switch execErr.Code {
-	case ErrGptOssUnreachable.Code, ErrToolExecution.Code:
-		return true
-	default:
-		return false
-	}
+	// Unknown error type — treat as non-transient to avoid blind retries.
+	return false
 }
